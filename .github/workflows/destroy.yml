@@ -1,0 +1,121 @@
+name: Destroy Auto-Healing MIG
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm deletion'
+        required: true
+        type: string
+
+env:
+  TERRAFORM_VERSION: '1.6.0'
+  GCP_REGION: 'us-central1'
+  GCP_ZONE: 'us-central1-a'
+
+jobs:
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
+            echo "❌ Confirmation failed. You must type 'destroy' to proceed."
+            exit 1
+          fi
+          echo "✅ Confirmation validated"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Get current resources
+        working-directory: ./terraform
+        id: resources
+        run: |
+          echo "Current infrastructure:"
+          terraform show -no-color || echo "No state found"
+          
+          # Capture outputs before destroy
+          LB_IP=$(terraform output -raw lb_ip_address 2>/dev/null || echo "N/A")
+          MIG_NAME=$(terraform output -raw mig_name 2>/dev/null || echo "N/A")
+          
+          echo "lb_ip=$LB_IP" >> $GITHUB_OUTPUT
+          echo "mig_name=$MIG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Terraform Destroy
+        working-directory: ./terraform
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_region: ${{ env.GCP_REGION }}
+          TF_VAR_zone: ${{ env.GCP_ZONE }}
+        run: |
+          echo "Destroying infrastructure..."
+          terraform destroy -auto-approve
+
+      - name: Verify cleanup
+        run: |
+          echo "Verifying resources are deleted..."
+          
+          # Check for leftover instances
+          INSTANCES=$(gcloud compute instances list \
+            --filter="name:webapp-*" \
+            --format="value(name)" | wc -l)
+          
+          if [ "$INSTANCES" -gt 0 ]; then
+            echo "⚠️  Warning: $INSTANCES instances still exist"
+            gcloud compute instances list --filter="name:webapp-*"
+          else
+            echo "✅ All instances deleted"
+          fi
+          
+          # Check for leftover MIGs
+          MIGS=$(gcloud compute instance-groups managed list \
+            --filter="name:webapp-*" \
+            --format="value(name)" | wc -l)
+          
+          if [ "$MIGS" -gt 0 ]; then
+            echo "⚠️  Warning: $MIGS MIGs still exist"
+            gcloud compute instance-groups managed list --filter="name:webapp-*"
+          else
+            echo "✅ All MIGs deleted"
+          fi
+
+      - name: Cleanup Summary
+        if: always()
+        env:
+          LB_IP: ${{ steps.resources.outputs.lb_ip }}
+          MIG_NAME: ${{ steps.resources.outputs.mig_name }}
+        run: |
+          echo "=========================================="
+          echo "Infrastructure Destruction Summary"
+          echo "=========================================="
+          echo "Destroyed resources:"
+          echo "  - Load Balancer IP: $LB_IP"
+          echo "  - MIG Name: $MIG_NAME"
+          echo "  - Region: ${{ env.GCP_REGION }}"
+          echo "  - Zone: ${{ env.GCP_ZONE }}"
+          echo ""
+          echo "✅ Auto-Healing MIG infrastructure destroyed"
+          echo ""
+          echo "Note: Service account may need manual cleanup if not managed by Terraform"

@@ -1,0 +1,219 @@
+name: Test Auto-Healing
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: 'Instance name to test (leave empty to auto-select)'
+        required: false
+        type: string
+
+env:
+  GCP_ZONE: 'us-central1-a'
+
+jobs:
+  test-auto-healing:
+    name: Test Auto-Healing Behavior
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.0'
+
+      - name: Get Terraform Outputs
+        working-directory: ./terraform
+        id: tf_outputs
+        run: |
+          terraform init
+          echo "mig_name=$(terraform output -raw mig_name)" >> $GITHUB_OUTPUT
+          echo "lb_ip=$(terraform output -raw lb_ip_address)" >> $GITHUB_OUTPUT
+
+      - name: Verify MIG is running
+        env:
+          MIG_NAME: ${{ steps.tf_outputs.outputs.mig_name }}
+        run: |
+          echo "Checking MIG status..."
+          INSTANCE_COUNT=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+            --zone="${{ env.GCP_ZONE }}" \
+            --format="value(name)" | wc -l)
+          
+          echo "Running instances: $INSTANCE_COUNT"
+          
+          if [ "$INSTANCE_COUNT" -lt 3 ]; then
+            echo "❌ Expected at least 3 instances, found $INSTANCE_COUNT"
+            exit 1
+          fi
+          
+          echo "✅ MIG has sufficient instances"
+
+      - name: Select instance for testing
+        id: select_instance
+        env:
+          MIG_NAME: ${{ steps.tf_outputs.outputs.mig_name }}
+        run: |
+          if [ -n "${{ github.event.inputs.instance_name }}" ]; then
+            INSTANCE_NAME="${{ github.event.inputs.instance_name }}"
+          else
+            INSTANCE_NAME=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+              --zone="${{ env.GCP_ZONE }}" \
+              --filter="status:RUNNING" \
+              --format="value(instance)" \
+              --limit=1 | xargs basename)
+          fi
+          
+          echo "instance_name=$INSTANCE_NAME" >> $GITHUB_OUTPUT
+          echo "Selected instance: $INSTANCE_NAME"
+
+      - name: Record initial state
+        env:
+          MIG_NAME: ${{ steps.tf_outputs.outputs.mig_name }}
+        run: |
+          echo "Recording initial MIG state..."
+          gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+            --zone="${{ env.GCP_ZONE }}" \
+            --format="table(instance,status,instanceTemplate)"
+
+      - name: Simulate failure
+        env:
+          INSTANCE_NAME: ${{ steps.select_instance.outputs.instance_name }}
+        run: |
+          echo "Simulating failure on instance: $INSTANCE_NAME"
+          echo "Stopping webapp service to trigger health check failure..."
+          
+          gcloud compute ssh "$INSTANCE_NAME" \
+            --zone="${{ env.GCP_ZONE }}" \
+            --command="sudo systemctl stop webapp" \
+            2>/dev/null || echo "Command executed"
+          
+          echo "✅ Failure simulated"
+
+      - name: Wait for health check detection
+        run: |
+          echo "Waiting for health checks to detect failure..."
+          echo "This takes ~30-60 seconds (2 consecutive failed checks)"
+          sleep 60
+
+      - name: Monitor auto-healing
+        env:
+          MIG_NAME: ${{ steps.tf_outputs.outputs.mig_name }}
+          INSTANCE_NAME: ${{ steps.select_instance.outputs.instance_name }}
+        run: |
+          echo "Monitoring for auto-healing actions..."
+          
+          MAX_WAIT=300
+          ELAPSED=0
+          RECREATED=false
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Check for repair operations
+            REPAIR_COUNT=$(gcloud compute operations list \
+              --filter="operationType:compute.instances.repair AND targetLink:$INSTANCE_NAME" \
+              --format="value(name)" \
+              --limit=5 | wc -l)
+            
+            if [ "$REPAIR_COUNT" -gt 0 ]; then
+              echo "✅ Auto-healing repair operation detected!"
+              RECREATED=true
+              break
+            fi
+            
+            # Check if instance is being replaced
+            INSTANCE_EXISTS=$(gcloud compute instances describe "$INSTANCE_NAME" \
+              --zone="${{ env.GCP_ZONE }}" \
+              --format="value(status)" 2>/dev/null || echo "NOT_FOUND")
+            
+            if [ "$INSTANCE_EXISTS" = "NOT_FOUND" ]; then
+              echo "✅ Instance is being replaced"
+              RECREATED=true
+              break
+            fi
+            
+            echo "Waiting... ($ELAPSED/$MAX_WAIT seconds)"
+            sleep 15
+            ELAPSED=$((ELAPSED + 15))
+          done
+          
+          if [ "$RECREATED" = false ]; then
+            echo "❌ Auto-healing did not trigger within timeout"
+            exit 1
+          fi
+
+      - name: Wait for recovery
+        run: |
+          echo "Waiting for instance recovery and health checks..."
+          echo "This may take 5-6 minutes (initial delay + health stabilization)"
+          sleep 360
+
+      - name: Verify recovery
+        env:
+          MIG_NAME: ${{ steps.tf_outputs.outputs.mig_name }}
+        run: |
+          echo "Verifying all instances are healthy..."
+          
+          RUNNING_COUNT=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+            --zone="${{ env.GCP_ZONE }}" \
+            --filter="status:RUNNING" \
+            --format="value(instance)" | wc -l)
+          
+          echo "Running instances: $RUNNING_COUNT"
+          
+          if [ "$RUNNING_COUNT" -ge 3 ]; then
+            echo "✅ All instances recovered"
+          else
+            echo "❌ Not all instances recovered ($RUNNING_COUNT running)"
+            exit 1
+          fi
+
+      - name: Verify load balancer
+        env:
+          LB_IP: ${{ steps.tf_outputs.outputs.lb_ip }}
+        run: |
+          echo "Testing load balancer after recovery..."
+          
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$LB_IP/api/health")
+          
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✅ Load balancer is healthy after auto-healing"
+            curl -s "http://$LB_IP/api/health" | jq .
+          else
+            echo "❌ Load balancer returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Test Summary
+        if: always()
+        env:
+          MIG_NAME: ${{ steps.tf_outputs.outputs.mig_name }}
+          INSTANCE_NAME: ${{ steps.select_instance.outputs.instance_name }}
+        run: |
+          echo "=========================================="
+          echo "Auto-Healing Test Summary"
+          echo "=========================================="
+          echo "Tested Instance: $INSTANCE_NAME"
+          echo "MIG Name: $MIG_NAME"
+          echo ""
+          echo "Final MIG state:"
+          gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+            --zone="${{ env.GCP_ZONE }}" \
+            --format="table(instance,status,instanceTemplate,currentAction)"
+          echo ""
+          echo "Recent repair operations:"
+          gcloud compute operations list \
+            --filter="operationType:compute.instances.repair" \
+            --limit=5 \
+            --format="table(operationType,targetLink,status,endTime)"
