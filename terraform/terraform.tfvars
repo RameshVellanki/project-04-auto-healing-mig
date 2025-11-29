@@ -1,6 +1,6 @@
 # Copy this file to terraform.tfvars and update with your values
 
-project_id = "your-gcp-project-id"
+project_id = "leafy-glyph-479507-m4"
 region     = "us-central1"
 zone       = "us-central1-a"
 

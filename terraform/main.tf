@@ -9,10 +9,10 @@ terraform {
   }
 
   # Backend configuration for storing state in GCS
-  # backend "gcs" {
-  #   bucket = "your-terraform-state-bucket"
-  #   prefix = "project-04/terraform.tfstate"
-  # }
+  backend "gcs" {
+    bucket = "tftbk"
+    prefix = "project-04/terraform.tfstate"
+  }
 }
 
 provider "google" {
