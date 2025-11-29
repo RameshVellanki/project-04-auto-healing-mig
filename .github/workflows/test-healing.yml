@@ -71,9 +71,8 @@ jobs:
           else
             INSTANCE_NAME=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
               --zone="${{ env.GCP_ZONE }}" \
-              --filter="status:RUNNING" \
               --format="value(instance)" \
-              --limit=1 | xargs basename)
+              --limit=1 | awk -F'/' '{print $NF}')
           fi
           
           echo "instance_name=$INSTANCE_NAME" >> $GITHUB_OUTPUT
@@ -167,7 +166,6 @@ jobs:
           
           RUNNING_COUNT=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
             --zone="${{ env.GCP_ZONE }}" \
-            --filter="status:RUNNING" \
             --format="value(instance)" | wc -l)
           
           echo "Running instances: $RUNNING_COUNT"
