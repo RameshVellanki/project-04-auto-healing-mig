@@ -1,6 +1,6 @@
 # Backend Service
 resource "google_compute_backend_service" "webapp" {
-  name                  = "webapp-backend-service"
+  name                  = "webapp-backend-service1"
   protocol              = "HTTP"
   port_name             = "http"
   timeout_sec           = 30
