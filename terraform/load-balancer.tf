@@ -22,19 +22,19 @@ resource "google_compute_backend_service" "webapp" {
 
 # URL Map
 resource "google_compute_url_map" "webapp" {
-  name            = "webapp-url-map"
+  name            = "webapp-url-map1"
   default_service = google_compute_backend_service.webapp.id
 }
 
 # HTTP Proxy
 resource "google_compute_target_http_proxy" "webapp" {
-  name    = "webapp-http-proxy"
+  name    = "webapp-http-proxy1"
   url_map = google_compute_url_map.webapp.id
 }
 
 # Global Forwarding Rule
 resource "google_compute_global_forwarding_rule" "webapp" {
-  name                  = "webapp-forwarding-rule"
+  name                  = "webapp-forwarding-rule1"
   target                = google_compute_target_http_proxy.webapp.id
   port_range            = "80"
   ip_protocol           = "TCP"
@@ -43,7 +43,7 @@ resource "google_compute_global_forwarding_rule" "webapp" {
 
 # Firewall: Allow HTTP from internet
 resource "google_compute_firewall" "allow_http_from_internet" {
-  name    = "allow-http-from-internet-autohealing"
+  name    = "allow-http-from-internet-autohealing1"
   network = "default"
 
   allow {
